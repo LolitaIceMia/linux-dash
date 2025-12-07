@@ -92,15 +92,14 @@ cpu_temp() {
       echo "$((cpu/1000))" | _parseAndPrint
     ;;
     *)
-      if type -P sensors 2>/dev/null; then
-        returnString=`sensors`
-        #amd
-        if [[ "${returnString/"k10"}" != "${returnString}" ]] ; then
-          $ECHO ${returnString##*k10} | $CUT -d ' ' -f 6 | $CUT -c 2- | $CUT -c 1-4
-        #intel
-        elif [[ "${returnString/"core"}" != "${returnString}" ]] ; then
-          fromcore=${returnString##*"coretemp"}
-          $ECHO ${fromcore##*Physical}  | $CUT -d ' ' -f 3 | $CUT -c 2-5 | _parseAndPrint
+      if type -P sensors > /dev/null 2>&1; then
+        local SORT=$(type -P sort)
+        local cpu_temp_val=$(sensors | $GREP -E 'Core|Package|Tdie|Tctl' | $SED 's/ (.*//' | $SED -n 's/.*+\([0-9]*\.[0-9]*\).*/\1/p' | $SORT -nr | $HEAD -n 1)
+
+        if [ -n "$cpu_temp_val" ]; then
+          $ECHO "$cpu_temp_val" | _parseAndPrint
+        else
+          $ECHO "[]" | _parseAndPrint
         fi
       else
         $ECHO "[]" | _parseAndPrint
@@ -185,66 +184,91 @@ disk_partitions() {
 }
 
 docker_processes() {
-
-  local result=""
   local dockerCommand=$(type -P docker)
-  local containers="$($dockerCommand ps | $AWK '{if(NR>1) print $NF}')"
+  if [ -z "$dockerCommand" ]; then
+    $ECHO "[]" | _parseAndPrint
+    return
+  fi
 
-  for i in $containers; do
-  result="$result $($dockerCommand top $i axo pid,user,pcpu,pmem,comm --sort -pcpu,-pmem \
-        | $HEAD -n 15 \
-        | $AWK -v cnt="$i" 'BEGIN{OFS=":"} NR>1 {print "{ \"cname\": \"" cnt \
-                "\", \"pid\": " $1 \
-                ", \"user\": \"" $2 "\"" \
-                ", \"cpu%\": " $3 \
-                ", \"mem%\": " $4 \
-                ", \"cmd\": \"" $5 "\"" "},"\
-              }')"
+  if ! $dockerCommand ps > /dev/null 2>&1; then
+    $ECHO "[]" | _parseAndPrint
+    return
+  fi
+
+  local json_output=""
+
+  local containers=$($dockerCommand ps --format "{{.Names}}")
+
+  for cnt in $containers; do
+
+    local ps_out=$($dockerCommand top "$cnt" -eo pid,user,pcpu,pmem,comm 2>/dev/null | tail -n +2)
+
+    if [ -n "$ps_out" ]; then
+
+        local rows=$(echo "$ps_out" | $AWK -v cname="$cnt" '{
+
+            cmd=$5; for(i=6;i<=NF;i++) cmd=cmd" "$i;
+
+            gsub(/"/, "\\\"", cmd);
+
+            printf ",{ \"cname\": \"%s\", \"pid\": %s, \"user\": \"%s\", \"cpu%\": %s, \"mem%\": %s, \"cmd\": \"%s\" }", cname, $1, $2, $3, $4, cmd
+        }')
+
+        json_output="${json_output}${rows}"
+    fi
   done
 
-  $ECHO "[" ${result%?} "]" | _parseAndPrint
+  json_output="${json_output#,}"
+
+  $ECHO "[$json_output]" | _parseAndPrint
 }
 
 download_transfer_rate() {
+  local files=(/sys/class/net/*)
+  local initial_bytes=()
+  local json_output=""
+  local separator=""
+  local i=0
 
-	local files=(/sys/class/net/*)
-	local pos=$(( ${#files[*]} - 1 ))
-	local last=${files[$pos]}
 
-	local json_output="{"
+  for interface in "${files[@]}"; do
+    local basename=$(basename "$interface")
 
-	for interface in "${files[@]}"
-	do
-		basename=$(basename "$interface")
+    case "$basename" in
+        lo|br-*|docker*|veth*)
 
-		# find the number of bytes transfered for this interface
-		in1=$($CAT /sys/class/net/"$basename"/statistics/rx_bytes)
+            ;;
+    esac
 
-		# wait a second
-		sleep 1
 
-		# check same interface again
-		in2=$($CAT /sys/class/net/"$basename"/statistics/rx_bytes)
+    local bytes=$($CAT /sys/class/net/"$basename"/statistics/rx_bytes 2>/dev/null || echo 0)
+    initial_bytes+=($bytes)
+  done
 
-		# get the difference (transfer rate)
-		in_bytes=$((in2 - in1))
+  sleep 1
 
-		# convert transfer rate to KB
-		in_kbytes=$((in_bytes / 1024))
+  for interface in "${files[@]}"; do
+    local basename=$(basename "$interface")
 
-		# convert transfer rate to KB
-		json_output="$json_output \"$basename\": $in_kbytes"
+    case "$basename" in
+        lo|br-*|docker*|veth*)
+            i=$((i + 1))
+            continue
+            ;;
+    esac
 
-		# if it is not the last line
-		if [[ ! $interface == $last ]]
-		then
-			# add a comma to the line (JSON formatting)
-			json_output="$json_output,"
-		fi
-	done
+    local in2=$($CAT /sys/class/net/"$basename"/statistics/rx_bytes 2>/dev/null || echo 0)
+    local in1=${initial_bytes[$i]}
+    local diff=$((in2 - in1))
+    if [ $diff -lt 0 ]; then diff=0; fi
+    local in_kbytes=$((diff / 1024))
 
-	# close the JSON object & print to screen
-	$ECHO "$json_output}" | _parseAndPrint
+    json_output="${json_output}${separator}\"$basename\": $in_kbytes"
+    separator=","
+    i=$((i + 1))
+  done
+
+  $ECHO "{$json_output}" | _parseAndPrint
 }
 
 general_info() {
@@ -589,45 +613,42 @@ swap() {
 }
 
 upload_transfer_rate() {
+  local files=(/sys/class/net/*)
+  local initial_bytes=()
+  local json_output=""
+  local separator=""
+  local i=0
 
-	local files=(/sys/class/net/*)
-	local pos=$(( ${#files[*]} - 1 ))
-	local last=${files[$pos]}
+  for interface in "${files[@]}"; do
+    local basename=$(basename "$interface")
+    local bytes=$($CAT /sys/class/net/"$basename"/statistics/tx_bytes 2>/dev/null || echo 0)
+    initial_bytes+=($bytes)
+  done
 
-	local json_output="{"
+  sleep 1
 
-	for interface in "${files[@]}"
-	do
-		basename=$(basename "$interface")
+  for interface in "${files[@]}"; do
+    local basename=$(basename "$interface")
 
-		# find the number of bytes transfered for this interface
-		out1=$($CAT /sys/class/net/"$basename"/statistics/tx_bytes)
+    case "$basename" in
+        lo|br-*|docker*|veth*)
+            i=$((i + 1))
+            continue
+            ;;
+    esac
 
-		# wait a second
-		sleep 1
+    local out2=$($CAT /sys/class/net/"$basename"/statistics/tx_bytes 2>/dev/null || echo 0)
+    local out1=${initial_bytes[$i]}
+    local diff=$((out2 - out1))
+    if [ $diff -lt 0 ]; then diff=0; fi
+    local out_kbytes=$((diff / 1024))
 
-		# check same interface again
-		out2=$($CAT /sys/class/net/"$basename"/statistics/tx_bytes)
+    json_output="${json_output}${separator}\"$basename\": $out_kbytes"
+    separator=","
+    i=$((i + 1))
+  done
 
-		# get the difference (transfer rate)
-		out_bytes=$((out2 - out1))
-
-		# convert transfer rate to KB
-		out_kbytes=$((out_bytes / 1024))
-
-		# convert transfer rate to KB
-		json_output="$json_output \"$basename\": $out_kbytes"
-
-		# if it is not the last line
-		if [[ ! $interface == $last ]]
-		then
-			# add a comma to the line (JSON formatting)
-			json_output="$json_output,"
-		fi
-	done
-
-	# close the JSON object & print to screen
-	$ECHO "$json_output}" | _parseAndPrint
+  $ECHO "{$json_output}" | _parseAndPrint
 }
 
 user_accounts() {
